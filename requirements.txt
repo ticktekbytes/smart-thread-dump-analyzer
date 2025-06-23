@@ -1,0 +1,9 @@
+chainlit
+openai
+python-dotenv
+requests
+langchain
+langchain-community
+langchain-openai
+sqlalchemy
+psycopg2-binary
