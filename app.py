@@ -3,27 +3,36 @@ import chainlit as cl
 from src.analyzers.thread_analyzer import ThreadDumpAnalyzer
 from src.database.db_manager import SessionLocal, engine, get_db
 from src.utils.helpers import create_analysis_context
+import logging
 from config import *
 from src.models.thread_details import AnalysisSession, ThreadDump, ThreadDetails, ThreadLock
 from langchain.tools import Tool
 from src.tools.thread_tools import *
 from langchain.agents import initialize_agent, AgentType
-from langchain_openai import ChatOpenAI  # Updated import
-from sqlalchemy import text 
+from langchain_community.chat_models import ChatOpenAI
+from sqlalchemy import text  # <-- Add this import
+import asyncio
 
 
 
+# Initialize components
 client = AsyncOpenAI()
-
-# Instrument the OpenAI client
 cl.instrument_openai()
 analyzer = ThreadDumpAnalyzer()
+session_is_reset = False
 
 settings = {
     "model": "gpt-4",
     "temperature": 0,
 }
 
+# Logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    #filename='thread_analyzer.log'
+)
+logger = logging.getLogger(__name__)
 
 tools = [
     Tool(
@@ -53,11 +62,7 @@ tools = [
     # ),
 ]
 
-llm = ChatOpenAI(
-    api_key=OPENAI_API_KEY, 
-    model_name="gpt-4",
-    temperature=0
-)
+llm = ChatOpenAI(openai_api_key=OPENAI_API_KEY, model_name="gpt-4")
 agent = initialize_agent(
     tools,
     llm,
@@ -67,7 +72,9 @@ agent = initialize_agent(
 
 @cl.on_chat_start
 async def start():
-    # Start a new analysis session
+    global session_is_reset
+    session_is_reset = False  # Reset the flag when a new chat starts
+
     db = SessionLocal()
     try:
         session = AnalysisSession()
@@ -84,18 +91,23 @@ async def start():
                 max_files=20,
             ).send()
 
-        for file in files:
-            try:
-                with open(file.path, 'r') as f:
-                    content = f.read()
-                    # Pass session.id to the parser!
-                    thread_dump = analyzer.parse_dump(content, file.name, session.id)
-                    thread_dump.session_id = session.id
-                    db.add(thread_dump)
-                    db.commit()
-                    db.refresh(thread_dump)
+        await process_uploaded_files(files, session, db)
+    finally:
+        db.close()
 
-                    summary = f"""
+async def process_uploaded_files(files, session, db):
+    analyzer = ThreadDumpAnalyzer()
+    for file in files:
+        try:
+            with open(file.path, 'r') as f:
+                content = f.read()
+                thread_dump = analyzer.parse_dump(content, file.name, session.id)
+                thread_dump.session_id = session.id
+                db.add(thread_dump)
+                db.commit()
+                db.refresh(thread_dump)
+
+                summary = f"""
 ### Thread Dump Analysis for {file.name}
 
 #### Detected Patterns:
@@ -103,17 +115,35 @@ async def start():
 - High CPU Threads: {thread_dump.high_cpu_threads_exist}
 - Lock Contentions: {thread_dump.lock_contentions_exist}
 """
-                    await cl.Message(content=summary).send()
-            except Exception as e:
-                db.rollback()
-                error_msg = f"Error processing {file.name}: {str(e)}"
-                logger.error(error_msg)
-                await cl.Message(content=f"❌ {error_msg}").send()
-    finally:
-        db.close()
+                await cl.Message(content=summary).send()
+        except Exception as e:
+            db.rollback()
+            error_msg = f"Error processing {file.name}: {str(e)}"
+            logger.error(error_msg)
+            await cl.Message(content=f"❌ {error_msg}").send()
+    # 1. Send a plain message to re-enable chat input
+    await cl.Message(
+        content="You can now ask questions about the uploaded thread dumps, such as 'get thread state counts'."
+    ).send()
+    # 2. (Optional) Send the Start New Session button in a separate message
+    await cl.Message(
+        content="",
+        actions=[
+            cl.Action(
+                name="new_session",
+                payload={"action": "start_new_session"},
+                label="🔄 Start New Session"
+            )
+        ]
+    ).send()
 
 @cl.on_message
 async def main(message: cl.Message):
+    global session_is_reset
+    if session_is_reset:
+        await cl.Message(content="❌ Session data has been cleared. Please reload the page (Ctrl+R or Cmd+R) to start a new session.").send()
+        return
+
     try:
         # Get the latest analysis session
         db = SessionLocal()
@@ -136,8 +166,8 @@ async def main(message: cl.Message):
         thinking_msg.content = "🤔 Analyzing thread dumps and generating insights..."
         await thinking_msg.send()
 
-        # Run the agent
-        response = agent.run({
+        # Use agent.invoke for sync support (no await)
+        response = agent.invoke({
             "input": f"{message.content}\nSession ID: {session_id}"
         })
 
@@ -152,9 +182,14 @@ async def main(message: cl.Message):
             for idx, step in enumerate(response.intermediate_steps, 1):
                 logger.info(f"Analysis Step {idx}: {step}")
         
-        # Send response with action button
+        # Format response nicely if it's a dict with 'output'
+        if isinstance(response, dict) and "output" in response:
+            answer = response["output"]
+        else:
+            answer = str(response)
+
         await cl.Message(
-            content=str(response),
+            content=answer,
             actions=[
                 cl.Action(
                     name="new_session",
@@ -194,15 +229,21 @@ async def main(message: cl.Message):
 
 @cl.action_callback("new_session")
 async def on_new_session(action):
-    # Get the latest session
+    global session_is_reset
     db = SessionLocal()
     try:
         session = db.query(AnalysisSession).order_by(AnalysisSession.created_at.desc()).first()
         if session:
             reset_session_data(session.id)
-            await cl.Message(content="✅ Current session data cleared. Please upload new thread dump files to start a fresh session.").send()
+            session_is_reset = True
+            await cl.Message(
+                content="✅ Current session data cleared. Please reload the page (Ctrl+R or Cmd+R) to start a completely fresh session."
+            ).send()
         else:
-            await cl.Message(content="No session found to reset.").send()
+            session_is_reset = True
+            await cl.Message(
+                content="No session found to reset. Please reload the page (Ctrl+R or Cmd+R) to start a session."
+            ).send()
     finally:
         db.close()
 
