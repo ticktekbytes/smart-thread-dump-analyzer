@@ -1,4 +1,4 @@
-from sqlalchemy import Column, String, Integer, Float, Boolean, ForeignKey, DateTime, Text
+from sqlalchemy import Column, String, Integer, Float, Boolean, ForeignKey, DateTime, Text, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -10,8 +10,11 @@ Base = declarative_base()
 class AnalysisSession(Base):
     __tablename__ = 'analysis_sessions'
     
-    id = Column(Integer, Sequence('analysis_session_id_seq'), primary_key=True)
+    id = Column(BigInteger, primary_key=True)
+    client_id = Column(String, nullable=False)  # Make this required
+    browser_id = Column(String, nullable=False)  # Add browser identifier
     created_at = Column(DateTime, default=datetime.utcnow)
+    is_active = Column(Boolean, default=True)   # Add active status
     thread_dumps = relationship("ThreadDump", back_populates="session")
 
 class ThreadDump(Base):
@@ -20,7 +23,7 @@ class ThreadDump(Base):
     id = Column(Integer, Sequence('thread_dump_id_seq'), primary_key=True)
     file_name = Column(String(255))
     timestamp = Column(DateTime)
-    session_id = Column(Integer, ForeignKey('analysis_sessions.id'))
+    session_id = Column(BigInteger, ForeignKey('analysis_sessions.id'))
     total_threads = Column(Integer)
     running_threads = Column(Integer)
     blocked_threads = Column(Integer)
@@ -36,14 +39,14 @@ class ThreadDump(Base):
     timed_waiting_parking = Column(Integer, default=0)
     
     session = relationship("AnalysisSession", back_populates="thread_dumps")
-    threads = relationship("ThreadDetails", back_populates="thread_dump")
+    threads = relationship("ThreadDetails", back_populates="thread_dump", cascade="all, delete-orphan")
 
 class ThreadDetails(Base):
     __tablename__ = 'thread_details'
     
     id = Column(Integer, Sequence('thread_details_id_seq'), primary_key=True)
     thread_dump_id = Column(Integer, ForeignKey('thread_dumps.id'))
-    session_id = Column(Integer, ForeignKey('analysis_sessions.id'))  # <-- Add this line
+    session_id = Column(BigInteger, ForeignKey('analysis_sessions.id'))
     name = Column(String(255))
     thread_id = Column(String(50))
     daemon = Column(Boolean)
@@ -55,10 +58,10 @@ class ThreadDetails(Base):
     nid = Column(String(50))
     state = Column(String(50))
     sub_state = Column(String(50))
-    stack_trace = Column(String)
+    stack_trace = Column(Text)
     
     thread_dump = relationship("ThreadDump", back_populates="threads")
-    locks = relationship("ThreadLock", back_populates="thread")
+    locks = relationship("ThreadLock", back_populates="thread", cascade="all, delete-orphan")
 
 class ThreadLock(Base):
     __tablename__ = 'thread_locks'
@@ -70,3 +73,4 @@ class ThreadLock(Base):
     is_owner = Column(Boolean, default=False)
     
     thread = relationship("ThreadDetails", back_populates="locks")
+

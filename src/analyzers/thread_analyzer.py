@@ -28,7 +28,9 @@ LOCK_PATTERN = re.compile(r'- (?:waiting on|waiting to lock|locked|parking to wa
 
 class ThreadDumpAnalyzer:
     def __init__(self):
-        pass  # Removed self.thread_pattern
+        from src.rag.thread_vector_store import ThreadVectorStore
+        self.rag = ThreadVectorStore()
+        logger.info("Initialized ThreadDumpAnalyzer with vector store")
 
     def parse_dump(self, content: str, file_name: str, session_id=None) -> ThreadDump:
         """Parse thread dump content and return structured data"""
@@ -92,6 +94,7 @@ class ThreadDumpAnalyzer:
         thread_dump.threads = threads
         self._analyze_thread_dump(thread_dump)
         
+        logger.info(f"Parsed thread dump with {len(thread_dump.threads) if thread_dump.threads else 0} threads")
         return thread_dump
     
     def _parse_thread_state(self, state_line: str) -> Tuple[str, str]:
@@ -179,3 +182,54 @@ class ThreadDumpAnalyzer:
         logger.info(f"Analyzed thread dump: {thread_dump.file_name}")
         logger.info(f"States: {states}")
         logger.info(f"Substates: {substates}")
+        
+        return states  # Add this return
+
+    async def analyze_with_knowledge_base(self, thread_dump: ThreadDump) -> dict:
+        """Analyze thread dump using both standard analysis and knowledge base."""
+        # First perform standard analysis
+        states = self._analyze_thread_dump(thread_dump)
+        
+        kb_insights = []
+        
+        # Check each thread against knowledge base
+        for thread in thread_dump.threads:
+            try:
+                # Create thread info dict for KB search
+                thread_info = {
+                    'name': thread.name,
+                    'state': thread.state,
+                    'stack_trace': thread.stack_trace,
+                    'tid': thread.tid,
+                    'cpu_time': thread.cpu_time
+                }
+                
+                # Get insights from knowledge base
+                similar_threads = await self.rag.find_similar_threads(thread_info)
+                
+                # Filter high confidence matches
+                for match in similar_threads:
+                    if match['similarity'] > 0.85:
+                        kb_insights.append({
+                            'current_thread': {
+                                'name': thread.name,
+                                'state': thread.state,
+                                'tid': thread.tid
+                            },
+                            'similar_thread': match['thread'],
+                            'problem_info': match.get('problem_info', {}),
+                            'similarity': match['similarity']
+                        })
+                        
+            except Exception as e:
+                logger.error(f"Error getting KB insights for thread {thread.name}: {str(e)}")
+                
+        return {
+            'standard_analysis': {
+                'states': states,
+                'high_cpu_exists': thread_dump.high_cpu_threads_exist,
+                'lock_contentions_exist': thread_dump.lock_contentions_exist,
+                'total_threads': thread_dump.total_threads
+            },
+            'kb_insights': kb_insights
+        }
